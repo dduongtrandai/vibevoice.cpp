@@ -1,0 +1,333 @@
+# vibevoice.cpp — multi-backend release pipeline
+#
+# Triggers on version tags (v*). Builds pre-compiled binaries for every
+# supported {OS × backend} combination, packages them as zip archives,
+# and publishes a GitHub Release with all artifacts attached.
+#
+# Matrix:
+#   Linux   : cpu, cuda-12, vulkan
+#   Windows : cpu, cuda-12, vulkan
+#   macOS   : cpu (Metal via GGML_METAL, universal binary)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow manual dispatch for testing the pipeline without a tag.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (e.g. v0.1.0). Leave empty for a dry-run without publishing."
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # needed by softprops/action-gh-release
+
+# Cancel previous runs on the same ref so we don't waste runner minutes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+#  Reusable fragments
+# ---------------------------------------------------------------------------
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # =========================================================================
+  #  Build matrix
+  # =========================================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ──────────────────────────────────────────────────────
+          - name: linux-cpu
+            os: ubuntu-22.04
+            cmake_flags: "-DGGML_BLAS=ON"
+            artifact: vibevoice-linux-cpu
+
+          - name: linux-cuda-12
+            os: ubuntu-22.04
+            cuda: "12.6.2"
+            cmake_flags: "-DVIBEVOICE_GGML_CUDA=ON"
+            artifact: vibevoice-linux-cuda-12
+            sub_packages: '["nvcc", "cudart"]'
+            non_cuda_sub_packages: '["libcublas-dev", "libcurand-dev"]'
+
+          - name: linux-vulkan
+            os: ubuntu-22.04
+            vulkan: true
+            cmake_flags: "-DVIBEVOICE_GGML_VULKAN=ON"
+            artifact: vibevoice-linux-vulkan
+
+          # ── Windows ───────────────────────────────────────────────────
+          - name: win-cpu
+            os: windows-2022
+            cmake_flags: ""
+            artifact: vibevoice-win-cpu
+
+          - name: win-cuda-12
+            os: windows-2022
+            cuda: "12.6.2"
+            cmake_flags: "-DVIBEVOICE_GGML_CUDA=ON"
+            artifact: vibevoice-win-cuda-12
+            sub_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "visual_studio_integration"]'
+            non_cuda_sub_packages: '[]'
+
+          - name: win-vulkan
+            os: windows-2022
+            vulkan: true
+            cmake_flags: "-DVIBEVOICE_GGML_VULKAN=ON"
+            artifact: vibevoice-win-vulkan
+
+          # ── macOS (Metal, universal) ──────────────────────────────────
+          - name: macos-metal
+            os: macos-14                # Apple Silicon runner
+            cmake_flags: "-DVIBEVOICE_GGML_METAL=ON -DCMAKE_OSX_ARCHITECTURES='arm64;x86_64'"
+            artifact: vibevoice-macos-metal
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # ── checkout ────────────────────────────────────────────────────
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0           # full history so version.cmake gets a hash
+
+      # ── CUDA toolkit (Linux & Windows) ─────────────────────────────
+      - name: Install CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.30
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: ${{ matrix.sub_packages }}
+          non-cuda-sub-packages: ${{ matrix.non_cuda_sub_packages }}
+
+      # ── Vulkan SDK ─────────────────────────────────────────────────
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.vulkan && runner.os == 'Linux'
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.vulkan && runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1.0.5
+        with:
+          vulkan_version: 1.3.290.0
+          install_runtime: true
+          cache: true
+          optional_components: com.lunarg.vulkan.vma
+          stripdown: true
+
+      # ── Linux dependencies (BLAS for CPU build) ────────────────────
+      - name: Install OpenBLAS (Linux CPU)
+        if: runner.os == 'Linux' && !matrix.cuda && !matrix.vulkan
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # ── MSVC dev environment (Windows, needed for Ninja) ────────────
+      - name: Setup MSVC dev environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ── Configure (Unix) ────────────────────────────────────────────
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DVIBEVOICE_SHARED=ON
+          ${{ matrix.cmake_flags }}
+
+      # ── Configure (Windows with Ninja) ──────────────────────────────
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DVIBEVOICE_SHARED=ON
+          ${{ matrix.cmake_flags }}
+
+      # ── Build (Unix) ─────────────────────────────────────────────────
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j "$(nproc)"
+
+      # ── Build (Windows) ────────────────────────────────────────────────
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j $env:NUMBER_OF_PROCESSORS
+
+      # ── Package (Linux / macOS) ────────────────────────────────────
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          # Copy main binaries
+          for bin in vibevoice-cli vibevoice-quantize; do
+            [ -f "build/bin/$bin" ] && cp "build/bin/$bin" staging/
+            [ -f "build/$bin" ] && cp "build/$bin" staging/
+          done
+          # Copy shared libs (ggml backends, libvibevoice if present)
+          find build -maxdepth 3 \( -name "*.so" -o -name "*.dylib" \) \
+            -exec cp {} staging/ \;
+          # Static import library (if present)
+          find build -maxdepth 3 -name "*.a" -path "*/libvibevoice*" \
+            -exec cp {} staging/ \;
+          # Metal shader (macOS)
+          find build -maxdepth 3 -name "*.metal" -exec cp {} staging/ \;
+          # Include public headers + docs
+          cp include/vibevoice.h staging/
+          cp include/vibevoice_capi.h staging/
+          cp README.md LICENSE staging/
+          # Create archive
+          cd staging
+          tar czf "../${{ matrix.artifact }}.tar.gz" .
+
+      # ── Package (Windows) ──────────────────────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          # Copy main binaries
+          $exes = @("vibevoice-cli.exe", "vibevoice-quantize.exe")
+          foreach ($exe in $exes) {
+            $path1 = "build/$exe"
+            $path2 = "build/bin/$exe"
+            if (Test-Path $path1) { Copy-Item $path1 staging/ }
+            elseif (Test-Path $path2) { Copy-Item $path2 staging/ }
+          }
+          # Copy DLLs (ggml backends, vibevoice shared lib, CUDA runtime, Vulkan loader)
+          Get-ChildItem -Path build -Recurse -Include "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName staging/
+          }
+          # Copy import libraries (.lib) for linking against the shared lib
+          Get-ChildItem -Path build -Recurse -Include "vibevoice.lib" | ForEach-Object {
+            Copy-Item $_.FullName staging/
+          }
+          # Include public headers + docs
+          Copy-Item include/vibevoice.h staging/
+          Copy-Item include/vibevoice_capi.h staging/
+          Copy-Item README.md staging/
+          Copy-Item LICENSE staging/
+          # Create zip
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # ── Upload build artifact (Unix) ───────────────────────────────
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+      # ── Upload build artifact (Windows) ────────────────────────────
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  # =========================================================================
+  #  Publish GitHub Release
+  # =========================================================================
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          cat > notes.md << 'NOTES_EOF'
+          ## vibevoice.cpp $TAG
+
+          Pre-compiled binaries for all supported backends. Download the archive
+          matching your OS and GPU, extract, and run `vibevoice-cli` directly.
+
+          ### Downloads
+
+          | Archive | OS | Backend | GPU |
+          |---|---|---|---|
+          | `vibevoice-linux-cpu.tar.gz` | Linux x86_64 | CPU (OpenBLAS) | — |
+          | `vibevoice-linux-cuda-12.tar.gz` | Linux x86_64 | CUDA 12 | NVIDIA |
+          | `vibevoice-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | AMD / Intel / NVIDIA |
+          | `vibevoice-win-cpu.zip` | Windows x64 | CPU | — |
+          | `vibevoice-win-cuda-12.zip` | Windows x64 | CUDA 12 | NVIDIA |
+          | `vibevoice-win-vulkan.zip` | Windows x64 | Vulkan | AMD / Intel / NVIDIA |
+          | `vibevoice-macos-metal.tar.gz` | macOS (Universal) | Metal | Apple Silicon / Intel |
+
+          ### Quick start
+
+          ```bash
+          # 1. Text-to-Speech (TTS)
+          ./vibevoice-cli tts \
+              --model models/vibevoice-realtime-0.5B-q8_0.gguf \
+              --tokenizer models/tokenizer.gguf \
+              --voice models/voice-en-Carter_man.gguf \
+              --text "Hello world." \
+              --out hello.wav
+
+          # 2. Automatic Speech Recognition (ASR)
+          ./vibevoice-cli asr \
+              --model models/vibevoice-asr-q8_0.gguf \
+              --tokenizer models/tokenizer.gguf \
+              --audio hello.wav
+          ```
+
+          > Models are **not** included in the binary archives.
+          > Download pre-converted GGUFs from https://huggingface.co/mudler/vibevoice.cpp-models
+          NOTES_EOF
+          # Substitute the tag into the notes
+          sed -i "s/\$TAG/$TAG/g" notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "vibevoice.cpp ${{ steps.tag.outputs.name }}"
+          body_path: notes.md
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, 'rc') || contains(steps.tag.outputs.name, 'beta') || contains(steps.tag.outputs.name, 'alpha') }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
